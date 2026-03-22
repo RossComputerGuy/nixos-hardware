@@ -16,25 +16,33 @@
         cp ${config.system.build.secboot}/*.bin $out/lib/firmware
       '')
     ];
+    enableRedistributableFirmware = true;
   };
 
+  # Kernel 6.6.92 — includes critical display, HDMI, and stability fixes over 6.6.18:
+  #   - 09467c5: Remove DRIVER_MODESET from IMG GPU (fixes Wayland compositor conflict)
+  #   - 2fab721: Remove hardcoded HDMI clock whitelist (allows most display resolutions)
+  #   - 4484e0c: Fix gamma timing (prevents display artifacts)
+  #   - 7cc1d86: Fix Framework backlight pinctrl error
+  #   - 3d3ce30: Fix HDMI suspend kernel panic
   boot.kernelPackages = lib.mkDefault (
     pkgs.linuxPackagesFor (
-      pkgs.buildLinux rec {
-        version = "6.6.18";
-        modDirVersion = version;
+      pkgs.buildLinux {
+        version = "6.6.92";
+        modDirVersion = "6.6.92";
         src = pkgs.fetchFromGitHub {
           owner = "DC-DeepComputing";
           repo = "fml13v03_linux";
-          rev = "7842fe7eb2ccc33fc7002dd2a04e575831b921c3";
-          hash = "sha256-/ysRPYqIW1CJ0Itp1cVkQk5d3mzqqXYI4rleCIDY6yE=";
+          rev = "417741216c08b3718c5ed541cce3523eb7ab20e4";
+          hash = "sha256-lQYLKqhdQin0cydQJ22YK1Anzjsi4qI6SToYLH8/hPI=";
         };
         defconfig = "fml13v03_defconfig";
+
+        # NixOS build-system patches (fix $(src) vs $(srctree), codec conflicts, etc).
+        # Two patches from the 6.6.18 era are already fixed in 6.6.92:
+        #   - eswin-ai-dsp: __clk_is_enabled now has extern declaration
+        #   - eswin-headers: es_proc Makefile no longer copies headers
         kernelPatches = [
-          {
-            name = "fix-eswin-ai-dsp";
-            patch = ./linux-fix-eswin-ai-dsp.patch;
-          }
           {
             name = "fix-eswin-media-ext";
             patch = ./linux-fix-eswin-media-ext.patch;
@@ -46,10 +54,6 @@
           {
             name = "fix-eswin-mem";
             patch = ./linux-fix-eswin-mem.patch;
-          }
-          {
-            name = "fix-eswin-headers";
-            patch = ./linux-fix-eswin-headers.patch;
           }
           {
             name = "fix-eswin-dev-buff";
@@ -64,13 +68,53 @@
             patch = ./linux-fix-eswin-sysfs.patch;
           }
         ];
+
         structuredExtraConfig = with lib.kernel; {
           DWC_MIPI_TC_DPHY_GEN3 = no;
           DEBUG_INFO_BTF = lib.mkForce no;
+          # Vendor modules referencing unexported symbols
+          ESWIN_WATCHDOG = no;
+          RSTKDUMP = no;
         };
+
+        extraMakeFlags = [
+          # zihintpause extension for assembler + GCC 15 compat
+          "KCFLAGS=-Wa,-march=rv64imafdc_zicsr_zifencei_zihintpause -Wno-error=incompatible-pointer-types"
+        ];
       }
     )
   );
+
+  # Boot: U-Boot extlinux (no UEFI on this device)
+  boot.loader = {
+    grub.enable = lib.mkDefault false;
+    generic-extlinux-compatible = {
+      enable = lib.mkDefault true;
+      configurationLimit = lib.mkDefault 10;
+    };
+  };
+
+  # Kernel parameters for display and firmware loading
+  boot.kernelParams = lib.mkDefault [
+    "console=tty0"
+    "console=ttyS0,115200"
+    "earlycon"
+    "rootwait"
+    "clk_ignore_unused"
+    "firmware_class.path=/lib/firmware/eic7x/"
+  ];
+
+  # Display: backlight defaults to off (bl_power=4) — turn it on at boot
+  systemd.services.backlight-on = {
+    description = "Turn on display backlight";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-udev-settle.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = "${pkgs.bash}/bin/bash -c 'if [ -e /sys/class/backlight/backlight/bl_power ]; then echo 0 > /sys/class/backlight/backlight/bl_power; echo 128 > /sys/class/backlight/backlight/brightness; fi'";
+    };
+  };
 
   system.build = {
     uboot = pkgs.buildUBoot {
